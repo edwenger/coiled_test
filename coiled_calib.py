@@ -30,65 +30,64 @@ class CoiledCalibration(ss.Calibration):
             self.calib_pars = calib_pars
         self.run_args.update(kwargs) # Update optuna settings
 
-        cluster = coiled.Cluster(
+        with coiled.Cluster(
             n_workers=10,
             name='StarsimCalibrationOnCoiled',
-        )
-        client = cluster.get_client()
+        ) as cluster:
+            with cluster.get_client() as client:
+                # Run the optimization
+                t0 = sc.tic()
+                self.run_args.storage = op.integration.DaskStorage(storage=None, client=client)
+                self.study = self.make_study()
 
-        # Run the optimization
-        t0 = sc.tic()
-        self.run_args.storage = op.integration.DaskStorage(storage=None, client=client)
-        self.study = self.make_study()
+                #self.run_workers() # <-- This is the line from the base class to run locally using multiprocessing
+                futures = [
+                    client.submit(
+                        self.study.optimize,
+                        self.run_trial,
+                        n_trials=self.run_args.n_trials,
+                        pure=False
+                    )
+                    for _ in range(self.run_args.n_workers)
+                ]
 
-        #self.run_workers() # <-- This is the line from the base class to run locally using multiprocessing
-        futures = [
-            client.submit(
-                self.study.optimize,
-                self.run_trial,
-                n_trials=self.run_args.n_trials,
-                pure=False
-            )
-            for _ in range(self.run_args.n_workers)
-        ]
+                wait(futures)
+                #################################
 
-        wait(futures)
-        #################################
+                study = op.load_study(storage=self.run_args.storage, study_name=self.run_args.study_name, sampler=self.run_args.sampler)
+                self.best_pars = sc.objdict(study.best_params)
+                self.elapsed = sc.toc(t0, output=True)
 
-        study = op.load_study(storage=self.run_args.storage, study_name=self.run_args.study_name, sampler=self.run_args.sampler)
-        self.best_pars = sc.objdict(study.best_params)
-        self.elapsed = sc.toc(t0, output=True)
-
-        self.sim_results = []
-        if load:
-            if self.verbose: print('Loading saved results...')
-            for trial in study.trials:
-                n = trial.number
-                try:
-                    filename = self.tmp_filename % trial.number
-                    results = sc.load(filename)
-                    self.sim_results.append(results)
-                    if tidyup:
+                self.sim_results = []
+                if load:
+                    if self.verbose: print('Loading saved results...')
+                    for trial in study.trials:
+                        n = trial.number
                         try:
-                            os.remove(filename)
-                            if self.verbose: print(f'    Removed temporary file {filename}')
+                            filename = self.tmp_filename % trial.number
+                            results = sc.load(filename)
+                            self.sim_results.append(results)
+                            if tidyup:
+                                try:
+                                    os.remove(filename)
+                                    if self.verbose: print(f'    Removed temporary file {filename}')
+                                except Exception as E:
+                                    errormsg = f'Could not remove {filename}: {str(E)}'
+                                    if self.verbose: print(errormsg)
+                            if self.verbose: print(f'  Loaded trial {n}')
                         except Exception as E:
-                            errormsg = f'Could not remove {filename}: {str(E)}'
+                            errormsg = f'Warning, could not load trial {n}: {str(E)}'
                             if self.verbose: print(errormsg)
-                    if self.verbose: print(f'  Loaded trial {n}')
-                except Exception as E:
-                    errormsg = f'Warning, could not load trial {n}: {str(E)}'
-                    if self.verbose: print(errormsg)
 
-        # Compare the results
-        self.parse_study(study)
+                # Compare the results
+                self.parse_study(study)
 
-        if self.verbose: print('Best pars:', self.best_pars)
+                if self.verbose: print('Best pars:', self.best_pars)
 
-        # Tidy up
-        self.calibrated = True
-        if not self.run_args.keep_db:
-            self.remove_db()
+                # Tidy up
+                self.calibrated = True
+                if not self.run_args.keep_db:
+                    self.remove_db()
 
         return self
 
