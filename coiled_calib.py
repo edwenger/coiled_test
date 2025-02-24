@@ -1,10 +1,9 @@
-from dask.distributed import get_client, wait
+from dask.distributed import wait
 import starsim as ss
 import sciris as sc
 import pandas as pd
 import numpy as np
 import coiled
-import optuna as op
 
 debug = False # If true, will run in serial
 total_trials = [100, 10][debug]
@@ -24,74 +23,71 @@ class CoiledCalibration(ss.Calibration):
             verbose (bool): whether to print output from each trial
             kwargs (dict): if supplied, overwrite stored run_args (n_trials, n_workers, etc.)
         """
+        import optuna as op
+
         # Load and validate calibration parameters
         if calib_pars is not None:
             self.calib_pars = calib_pars
         self.run_args.update(kwargs) # Update optuna settings
 
-        # Run the optimization
-        t0 = sc.tic()
-        self.study = self.make_study()
-
-        #self.run_workers() # <-- This is the line from the base class to run locally using multiprocessing
-        ################################
-        cluster = coiled.Cluster(
+        with coiled.Cluster(
             n_workers=10,
-            name='StarsimCalibrationOnCoiled'
-        )
+            name='StarsimCalibrationOnCoiled',
+        ) as cluster:
+            with cluster.get_client() as client:
+                # Run the optimization
+                t0 = sc.tic()
+                self.run_args.storage = op.integration.DaskStorage(storage=None, client=client)
+                self.study = self.make_study()
 
-        # backend_storage = op.storages.InMemoryStorage() --> not sure this is needed
-        dask_storage = op.integration.DaskStorage(storage=None,
-                                                  client=cluster.get_client())
+                #self.run_workers() # <-- This is the line from the base class to run locally using multiprocessing
+                futures = [
+                    client.submit(
+                        self.study.optimize,
+                        self.run_trial,
+                        n_trials=self.run_args.n_trials,
+                        pure=False
+                    )
+                    for _ in range(self.run_args.n_workers)
+                ]
 
-        client = cluster.get_client()
-        futures = [
-            client.submit(
-                self.study.optimize,
-                self.run_trial,
-                n_trials=self.run_args.n_trials,
-                pure=False
-            )
-            for _ in range(self.run_args.n_workers)
-        ]
+                wait(futures)
+                #################################
 
-        wait(futures)
-        #################################
+                study = op.load_study(storage=self.run_args.storage, study_name=self.run_args.study_name, sampler=self.run_args.sampler)
+                self.best_pars = sc.objdict(study.best_params)
+                self.elapsed = sc.toc(t0, output=True)
 
-        study = op.load_study(storage=dask_storage, study_name=self.run_args.study_name, sampler=self.run_args.sampler)
-        self.best_pars = sc.objdict(study.best_params)
-        self.elapsed = sc.toc(t0, output=True)
-
-        self.sim_results = []
-        if load:
-            if self.verbose: print('Loading saved results...')
-            for trial in study.trials:
-                n = trial.number
-                try:
-                    filename = self.tmp_filename % trial.number
-                    results = sc.load(filename)
-                    self.sim_results.append(results)
-                    if tidyup:
+                self.sim_results = []
+                if load:
+                    if self.verbose: print('Loading saved results...')
+                    for trial in study.trials:
+                        n = trial.number
                         try:
-                            os.remove(filename)
-                            if self.verbose: print(f'    Removed temporary file {filename}')
+                            filename = self.tmp_filename % trial.number
+                            results = sc.load(filename)
+                            self.sim_results.append(results)
+                            if tidyup:
+                                try:
+                                    os.remove(filename)
+                                    if self.verbose: print(f'    Removed temporary file {filename}')
+                                except Exception as E:
+                                    errormsg = f'Could not remove {filename}: {str(E)}'
+                                    if self.verbose: print(errormsg)
+                            if self.verbose: print(f'  Loaded trial {n}')
                         except Exception as E:
-                            errormsg = f'Could not remove {filename}: {str(E)}'
+                            errormsg = f'Warning, could not load trial {n}: {str(E)}'
                             if self.verbose: print(errormsg)
-                    if self.verbose: print(f'  Loaded trial {n}')
-                except Exception as E:
-                    errormsg = f'Warning, could not load trial {n}: {str(E)}'
-                    if self.verbose: print(errormsg)
 
-        # Compare the results
-        self.parse_study(study)
+                # Compare the results
+                self.parse_study(study)
 
-        if self.verbose: print('Best pars:', self.best_pars)
+                if self.verbose: print('Best pars:', self.best_pars)
 
-        # Tidy up
-        self.calibrated = True
-        if not self.run_args.keep_db:
-            self.remove_db()
+                # Tidy up
+                self.calibrated = True
+                if not self.run_args.keep_db:
+                    self.remove_db()
 
         return self
 
